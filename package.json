@@ -1,9 +1,29 @@
 {
   "name": "atlas",
-  "description": "Atlas — a lightweight persistent memory bank for pi agents",
-  "version": "0.1.0",
+  "description": "Atlas — a bounded, local persistent memory bank for pi agents",
+  "version": "0.2.0",
   "keywords": ["pi-package"],
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
   "pi": {
     "extensions": ["./pi/extensions/index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.84.2",
+    "@earendil-works/pi-coding-agent": ">=0.84.2",
+    "typebox": ">=1.3.7"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.84.2",
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@types/node": "^24.0.0",
+    "typebox": "1.3.7",
+    "typescript": "^5.9.3"
   }
 }

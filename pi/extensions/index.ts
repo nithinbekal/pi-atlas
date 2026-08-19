@@ -1,303 +1,191 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
+import { archiveStaleDaily, compactDaily } from "./compaction.ts";
+import { atlasMemoryRoot, loadLimits } from "./config.ts";
 import {
-  readFileSync,
-  writeFileSync,
-  existsSync,
-  mkdirSync,
-  readdirSync,
-  renameSync,
-} from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
-import { join, resolve, basename, dirname } from "node:path";
+  buildAtlasContext,
+  injectAtlasContext,
+  matchProjects,
+  matchTriggers,
+  parseKnowledgeIndex,
+  parsePrivateConfig,
+  type TriggerMatch,
+} from "./retrieval.ts";
+import { lineCount, MemoryStore, renderBoundedOutput, truncateHead, type BoundedText } from "./storage.ts";
 
-// ─── Paths ──────────────────────────────────────────────────────────
-const ATLAS_ROOT =
-  process.env.ATLAS_ROOT || join(process.env.HOME || "", ".atlas");
-const MEMORY = join(ATLAS_ROOT, "memory");
-const KNOWLEDGE = join(MEMORY, "knowledge");
-const HISTORY_DAILY = join(MEMORY, "history", "daily");
+export function renderAtlasRead(result: BoundedText, limits: { maxReadBytes: number; maxReadLines: number }): string {
+  const notice = result.truncated
+    ? `[Atlas read output truncated; source has ${result.totalLines} lines and ${result.totalBytes} bytes.]`
+    : undefined;
+  return renderBoundedOutput(result.content, limits.maxReadBytes, limits.maxReadLines, notice);
+}
 
-// ─── Helpers ────────────────────────────────────────────────────────
-function safeRead(path: string): string | null {
-  try {
-    return readFileSync(path, "utf8");
-  } catch {
-    return null;
+export function renderSearchResults(
+  matches: TriggerMatch[],
+  limits: { maxReadBytes: number; maxReadLines: number },
+): string {
+  if (matches.length === 0) {
+    return truncateHead("No matching knowledge files found.", limits.maxReadBytes, limits.maxReadLines).content;
   }
+  const rows = matches.map((match) =>
+    `- knowledge/${match.filename} (matched: ${match.triggers.join(", ")}${match.description ? `; ${match.description}` : ""})`,
+  ).join("\n");
+  const full = `Found ${matches.length} matching knowledge file(s):\n${rows}`;
+  const bounded = truncateHead(full, limits.maxReadBytes, limits.maxReadLines);
+  return bounded.truncated
+    ? renderBoundedOutput(full, limits.maxReadBytes, limits.maxReadLines, "[Atlas search output truncated to configured read limits.]")
+    : bounded.content;
 }
 
-function todayISO(): string {
-  return new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-}
-
-/** Sandbox a relative path under MEMORY; reject escapes. */
-function resolveMemory(rel: string): string {
-  const full = resolve(MEMORY, rel);
-  if (!full.startsWith(MEMORY)) {
-    throw new Error(`Path must be within the atlas memory bank: ${rel}`);
-  }
-  return full;
-}
-
-// ─── Knowledge triggers ─────────────────────────────────────────────
-interface TriggerEntry {
-  filename: string;
-  triggers: string[];
-}
-
-function loadKnowledgeTriggers(): TriggerEntry[] {
-  const indexPath = join(KNOWLEDGE, "index.csv");
-  const content = safeRead(indexPath);
-  if (!content) return [];
-
-  const entries: TriggerEntry[] = [];
-  // Format: filename,description,"trigger1, trigger2"
-  for (const line of content.split("\n").slice(1)) {
-    // skip header
-    if (!line.trim()) continue;
-    const match = line.match(/^([^,]+),(?:[^,]*|"[^"]*"),(?:"([^"]*)"|(.+))$/);
-    if (!match) continue;
-    const filename = match[1].trim();
-    const triggerStr = (match[2] ?? match[3] ?? "").trim();
-    const triggers = triggerStr
-      .split(",")
-      .map((t) => t.trim().toLowerCase())
-      .filter(Boolean);
-    entries.push({ filename, triggers });
-  }
-  return entries;
-}
-
-function checkTriggers(
-  text: string,
-  entries: TriggerEntry[],
-): string[] {
-  const lower = text.toLowerCase();
-  const matched = new Set<string>();
-  for (const entry of entries) {
-    for (const trigger of entry.triggers) {
-      if (lower.includes(trigger)) {
-        matched.add(entry.filename);
-        break;
-      }
-    }
-  }
-  return [...matched];
-}
-
-// ─── Daily context archive ──────────────────────────────────────────
-/** If daily.md's date header is stale, archive it and start a fresh stub. */
-function archiveIfStale(): void {
-  const dailyPath = join(MEMORY, "daily.md");
-  const content = safeRead(dailyPath);
-  if (!content) return;
-
-  const dateMatch = content.match(/^## Today's Date:\s*(.+)/m);
-  const fileDate = dateMatch?.[1]?.trim();
-  const today = todayISO();
-
-  // Only archive for a real past date (YYYY-MM-DD). Keep "unknown"/blank as-is.
-  if (fileDate && /^\d{4}-\d{2}-\d{2}$/.test(fileDate) && fileDate !== today) {
-    mkdirSync(HISTORY_DAILY, { recursive: true });
-    const dest = join(HISTORY_DAILY, `${fileDate}.md`);
-    // Don't clobber an existing archive for that date; append a suffix.
-    let finalDest = dest;
-    let n = 2;
-    while (existsSync(finalDest)) {
-      finalDest = join(HISTORY_DAILY, `${fileDate}-${n}.md`);
-      n++;
-    }
-    renameSync(dailyPath, finalDest);
-    writeFileSync(
-      dailyPath,
-      `## Today's Date: ${today}\n\n**Status**: \n\n### In Progress\n\n### Completed\n\n### Key Decisions\n\n`,
-      "utf8",
-    );
-  }
-}
-
-// ─── Extension ──────────────────────────────────────────────────────
 export default function atlas(pi: ExtensionAPI) {
-  const triggerEntries = loadKnowledgeTriggers();
+  const limits = loadLimits();
+  const store = new MemoryStore(atlasMemoryRoot(), limits);
+  let lastWarning: string | undefined;
 
-  // ── Session start: archive stale daily context ──────────────────
-  pi.on("session_start", async (_event, _ctx) => {
+  const warnOnce = (message: string, notify: (message: string, level: "warning") => void): void => {
+    if (message === lastWarning) return;
+    lastWarning = message;
+    notify(message, "warning");
+  };
+
+  pi.on("session_start", async (_event, ctx) => {
     try {
-      archiveIfStale();
-    } catch {
-      /* best effort */
+      const archived = await archiveStaleDaily(store);
+      if (archived) ctx.ui.notify(`Atlas archived stale daily context to ${archived}`, "info");
+    } catch (error) {
+      warnOnce(`Atlas could not archive daily.md: ${(error as Error).message}`, ctx.ui.notify.bind(ctx.ui));
     }
   });
 
-  // ── Before agent start: inject memory + triggered knowledge ──────
-  pi.on("before_agent_start", async (event, _ctx) => {
-    const parts: string[] = [];
-
-    for (const rel of ["projects.md", "daily.md"]) {
-      const content = safeRead(join(MEMORY, rel));
-      if (content) parts.push(`## Atlas: ${rel}\n\n${content}`);
+  pi.on("before_agent_start", async (event, ctx) => {
+    try {
+      const context = await buildAtlasContext(store, event.prompt ?? "", ctx.cwd, limits);
+      if (!context.text) return;
+      lastWarning = undefined;
+      return { systemPrompt: injectAtlasContext(event.systemPrompt, context.text, limits) };
+    } catch (error) {
+      warnOnce(`Atlas context was not loaded: ${(error as Error).message}`, ctx.ui.notify.bind(ctx.ui));
+      return;
     }
-
-    // Triggered knowledge from the user's prompt
-    if (event.prompt) {
-      const hits = checkTriggers(event.prompt, triggerEntries);
-      const knowledgeParts: string[] = [];
-      for (const filename of hits) {
-        const content = safeRead(join(KNOWLEDGE, filename));
-        if (content) knowledgeParts.push(`### Knowledge: ${filename}\n\n${content}`);
-      }
-      if (knowledgeParts.length > 0) {
-        parts.push(`## Atlas Triggered Knowledge\n\n${knowledgeParts.join("\n\n")}`);
-      }
-    }
-
-    if (parts.length === 0) return;
-
-    const header = [
-      "# Atlas Memory Bank",
-      "",
-      "You have a persistent memory bank. Use atlas_read and atlas_update to read and update memory files.",
-      "Update daily.md when work is completed, new work starts, or a key decision is made.",
-      "Keep daily.md under 150 lines, one line per entry. NEVER overwrite existing entries — use atlas_update with mode \"append\".",
-      "",
-      ...parts,
-    ].join("\n");
-
-    return { systemPrompt: event.systemPrompt + "\n\n" + header };
   });
 
-  // ── Tool: atlas_read ─────────────────────────────────────────────
   pi.registerTool({
     name: "atlas_read",
     label: "Atlas Read",
-    description:
-      "Read a file from the Atlas memory bank by relative path (e.g. 'daily.md', 'projects.md', 'knowledge/index.csv', 'projects/my-project/README.md').",
-    promptSnippet: "Read an Atlas memory bank file by relative path",
+    description: `Read a memory-bank file by relative path. Output is bounded to ${limits.maxReadLines} lines or ${limits.maxReadBytes} bytes. Paths that escape memory/, including symbolic-link escapes, are rejected.`,
+    promptSnippet: "Read a bounded Atlas memory-bank file by relative path",
     promptGuidelines: [
-      "Use atlas_read to access memory bank files: daily.md, projects.md, knowledge docs.",
-      "Read daily.md and projects.md at session start if they weren't already injected.",
+      "Use atlas_read for specific Atlas files when injected context is insufficient.",
     ],
     parameters: Type.Object({
-      path: Type.String({
-        description: "Relative path within memory/ (e.g. 'daily.md')",
-      }),
+      path: Type.String({ description: "Relative path within memory/ (for example daily.md or knowledge/index.csv)" }),
     }),
     async execute(_toolCallId, params) {
-      const full = resolveMemory(params.path);
-      try {
-        const content = await readFile(full, "utf8");
-        return {
-          content: [{ type: "text", text: content }],
-          details: { path: params.path },
-        };
-      } catch {
-        throw new Error(`File not found: ${params.path}`);
-      }
-    },
-  });
-
-  // ── Tool: atlas_update ───────────────────────────────────────────
-  pi.registerTool({
-    name: "atlas_update",
-    label: "Atlas Update",
-    description:
-      "Update an Atlas memory bank file. mode 'append' adds to the end (use for daily.md log entries); mode 'replace' overwrites fully (read first with atlas_read).",
-    promptSnippet: "Append to or replace an Atlas memory bank file",
-    promptGuidelines: [
-      "Use atlas_update with mode 'append' to add entries to daily.md (Completed, Key Decisions, etc.).",
-      "Use mode 'replace' only for full rewrites — always atlas_read first to avoid losing content.",
-    ],
-    parameters: Type.Object({
-      path: Type.String({ description: "Relative path within memory/" }),
-      content: Type.String({ description: "Content to write or append" }),
-      mode: Type.Optional(
-        Type.Union([Type.Literal("replace"), Type.Literal("append")], {
-          description: "Write mode (default: replace)",
-        }),
-      ),
-    }),
-    async execute(_toolCallId, params) {
-      const full = resolveMemory(params.path);
-      const mode = params.mode || "replace";
-      try {
-        mkdirSync(dirname(full), { recursive: true });
-        if (mode === "append") {
-          const existing = safeRead(full) || "";
-          await writeFile(full, existing + params.content, "utf8");
-        } else {
-          await writeFile(full, params.content, "utf8");
-        }
-        return {
-          content: [{ type: "text", text: `Updated ${params.path} (${mode})` }],
-          details: { path: params.path, mode },
-        };
-      } catch (err: any) {
-        throw new Error(`Failed to update ${params.path}: ${err.message}`);
-      }
-    },
-  });
-
-  // ── Tool: atlas_search ───────────────────────────────────────────
-  pi.registerTool({
-    name: "atlas_search",
-    label: "Atlas Search",
-    description:
-      "Search the Atlas knowledge trigger index for reference docs matching keywords. Returns matching knowledge filenames.",
-    promptSnippet: "Search Atlas knowledge index by keywords",
-    parameters: Type.Object({
-      query: Type.String({ description: "Keywords to search for" }),
-    }),
-    async execute(_toolCallId, params) {
-      const hits = checkTriggers(params.query, triggerEntries);
-      if (hits.length === 0) {
-        return {
-          content: [{ type: "text", text: "No matching knowledge files found." }],
-          details: { matches: [] },
-        };
-      }
+      const result = await store.readBounded(params.path);
+      const text = renderAtlasRead(result, limits);
       return {
-        content: [
-          {
-            type: "text",
-            text: `Found ${hits.length} matching knowledge file(s):\n${hits.map((f) => `- knowledge/${f}`).join("\n")}`,
-          },
-        ],
-        details: { matches: hits },
+        content: [{ type: "text", text }],
+        details: {
+          path: params.path,
+          ...result,
+          outputBytes: Buffer.byteLength(text),
+          outputLines: lineCount(text),
+        },
       };
     },
   });
 
-  // ── Command: /atlas-status ───────────────────────────────────────
+  pi.registerTool({
+    name: "atlas_update",
+    label: "Atlas Update",
+    description: `Atomically replace or lock-safely append to an Atlas file. Appends serialize, preserve entry boundaries, and end in a newline. Input is limited to ${limits.maxInputLines} lines/${limits.maxInputBytes} bytes; final files to ${limits.maxFileLines} lines/${limits.maxFileBytes} bytes.`,
+    promptSnippet: "Atomically append to or replace an Atlas memory-bank file",
+    promptGuidelines: [
+      "Use atlas_update with mode 'append' for durable daily.md events.",
+      "Use atlas_update mode 'replace' only after atlas_read; replacement is atomic but intentionally replaces the full file.",
+    ],
+    parameters: Type.Object({
+      path: Type.String({ description: "Relative path within memory/" }),
+      content: Type.String({ description: "Content to append or atomically replace" }),
+      mode: Type.Optional(StringEnum(["replace", "append"] as const, { description: "Write mode (default: replace)" })),
+    }),
+    async execute(_toolCallId, params) {
+      const mode = params.mode ?? "replace";
+      if (mode === "append") await store.append(params.path, params.content);
+      else await store.replace(params.path, params.content);
+      return {
+        content: [{ type: "text", text: `Updated ${params.path} (${mode})` }],
+        details: { path: params.path, mode, bytes: Buffer.byteLength(params.content, "utf8") },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "atlas_search",
+    label: "Atlas Search",
+    description: `Search knowledge/index.csv with segment-aware trigger matching. Returns at most ${limits.maxKnowledgeMatches} matches and explains which triggers matched.`,
+    promptSnippet: "Search Atlas knowledge triggers with bounded results",
+    parameters: Type.Object({
+      query: Type.String({ description: "Keywords or phrase to match against knowledge triggers" }),
+    }),
+    async execute(_toolCallId, params) {
+      const index = await store.readOptional("knowledge/index.csv");
+      const matches = index === null
+        ? []
+        : matchTriggers(params.query, parseKnowledgeIndex(index)).slice(0, limits.maxKnowledgeMatches);
+      const text = renderSearchResults(matches, limits);
+      return {
+        content: [{ type: "text", text }],
+        details: {
+          matches,
+          outputBytes: Buffer.byteLength(text),
+          outputLines: lineCount(text),
+        },
+      };
+    },
+  });
+
   pi.registerCommand("atlas-status", {
-    description: "Show Atlas memory bank status (today's date, status, active projects)",
+    description: "Show bounded Atlas status, project matching, and configured safety limits",
     handler: async (_args, ctx) => {
-      const daily = safeRead(join(MEMORY, "daily.md"));
-      const projects = safeRead(join(MEMORY, "projects.md"));
-      const lines: string[] = ["🗺️ Atlas Status"];
-
-      if (daily) {
-        const date = daily.match(/^## Today's Date:\s*(.+)/m)?.[1] ?? "unknown";
-        const status = daily.match(/\*\*Status\*\*:\s*(.+)/m)?.[1] ?? "unknown";
-        lines.push(`Date: ${date}`);
-        lines.push(`Status: ${status}`);
-      } else {
-        lines.push("daily.md: (not created yet)");
+      try {
+        const daily = await store.readOptional("daily.md");
+        const projects = await store.readOptional("projects.md");
+        const configText = await store.readOptional("config.json");
+        const config = configText === null ? {} : parsePrivateConfig(configText);
+        const index = await store.readOptional("knowledge/index.csv");
+        const cwdMatches = matchProjects(config, "", ctx.cwd);
+        const lines = [
+          "🗺️ Atlas Status",
+          `Memory root: ${store.root}`,
+          `Daily date: ${daily?.match(/^## Today's Date:\s*(.+)/m)?.[1] ?? "not created"}`,
+          `Daily status: ${daily?.match(/^\*\*Status\*\*:\s*(.+)/m)?.[1] ?? "unknown"}`,
+          `Project index entries: ${(projects?.match(/^- .+/gm) ?? []).length}`,
+          `Private project aliases configured: ${config.projects?.length ?? 0}`,
+          `Projects matching cwd: ${cwdMatches.map((match) => match.project).join(", ") || "none"}`,
+          `Knowledge docs indexed: ${index === null ? 0 : parseKnowledgeIndex(index).length}`,
+          `Context budget: ${limits.maxContextLines} lines / ${limits.maxContextBytes} bytes`,
+        ];
+        ctx.ui.notify(lines.join("\n"), "info");
+      } catch (error) {
+        ctx.ui.notify(`Atlas status failed: ${(error as Error).message}`, "error");
       }
+    },
+  });
 
-      if (projects) {
-        const count = (projects.match(/^- .+/gm) || []).length;
-        lines.push(`Active projects: ${count}`);
+  pi.registerCommand("atlas-compact", {
+    description: "Snapshot daily.md and refresh bounded current.md without changing raw daily history",
+    handler: async (_args, ctx) => {
+      try {
+        const result = await compactDaily(store, limits);
+        ctx.ui.notify(
+          `Atlas current state refreshed (${result.currentBytes} bytes, sections: ${result.sections.join(", ") || "recent context"}).\nRaw snapshot: ${result.snapshotPath}\ndaily.md was not modified.`,
+          "info",
+        );
+      } catch (error) {
+        ctx.ui.notify(`Atlas compaction failed: ${(error as Error).message}`, "error");
       }
-
-      // Count knowledge docs
-      const index = safeRead(join(KNOWLEDGE, "index.csv"));
-      const knowledgeCount = index
-        ? index.split("\n").slice(1).filter((l) => l.trim()).length
-        : 0;
-      lines.push(`Knowledge docs: ${knowledgeCount}`);
-
-      ctx.ui.notify(lines.join("\n"), "info");
     },
   });
 }
