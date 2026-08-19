@@ -1,0 +1,19 @@
+# Private Atlas runtime memory — never commit or publish.
+memory/
+.obsidian/
+
+# Local package/build state.
+node_modules/
+coverage/
+.pi/
+*.local
+*.log
+.DS_Store
+
+# Environment files and secrets.
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key

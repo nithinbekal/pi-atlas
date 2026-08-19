@@ -1,0 +1,9 @@
+{
+  "name": "atlas",
+  "description": "Atlas — a lightweight persistent memory bank for pi agents",
+  "version": "0.1.0",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./pi/extensions/index.ts"]
+  }
+}
