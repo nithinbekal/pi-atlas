@@ -6,7 +6,6 @@ import test from "node:test";
 import { DEFAULT_LIMITS } from "../pi/extensions/config.ts";
 import {
   buildAtlasContext,
-  injectAtlasContext,
   matchProjects,
   matchTriggers,
   parseKnowledgeIndex,
@@ -89,10 +88,6 @@ test("retrieval remains layout-compatible, bounded, and reports provenance", asy
   assert.equal(context.knowledgeMatches[0].filename, "reference.md");
   assert.ok(Buffer.byteLength(context.text) <= limits.maxContextBytes, "rendered context including its preamble is byte bounded");
   assert.ok(lineCount(context.text) <= limits.maxContextLines, "rendered context including its preamble is line bounded");
-  const base = "existing system prompt";
-  const injected = injectAtlasContext(base, context.text, limits).slice(base.length);
-  assert.ok(Buffer.byteLength(injected) <= limits.maxContextBytes, "actual injected suffix includes separator overhead in its byte bound");
-  assert.ok(lineCount(injected) <= limits.maxContextLines, "actual injected suffix includes separator overhead in its line bound");
   assert.equal(context.sources.some((source) => source.path === "daily.md" && source.truncated), true);
   for (const source of context.sources) {
     assert.ok(Buffer.byteLength(source.content) <= limits.maxSourceBytes);

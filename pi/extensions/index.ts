@@ -5,7 +5,6 @@ import { archiveStaleDaily, compactDaily } from "./compaction.ts";
 import { atlasMemoryRoot, loadLimits } from "./config.ts";
 import {
   buildAtlasContext,
-  injectAtlasContext,
   knowledgePath,
   matchProjects,
   matchTriggers,
@@ -49,6 +48,7 @@ export default function atlas(pi: ExtensionAPI) {
   const limits = loadLimits();
   const store = new MemoryStore(atlasMemoryRoot(), limits);
   let lastWarning: string | undefined;
+  let lastSection = "";
 
   const warnOnce = (message: string, notify: (message: string, level: "warning") => void): void => {
     if (message === lastWarning) return;
@@ -67,15 +67,17 @@ export default function atlas(pi: ExtensionAPI) {
 
   pi.on("before_agent_start", async (event, ctx) => {
     try {
-      const context = await buildAtlasContext(store, event.prompt ?? "", ctx.cwd, limits);
+      const prompt = event.messageType === "user" ? event.prompt : "";
+      const context = await buildAtlasContext(store, prompt, ctx.cwd, limits);
+      lastSection = context.text;
       if (context.warnings.length > 0) warnOnce(context.warnings.join("\n"), ctx.ui.notify.bind(ctx.ui));
       else lastWarning = undefined;
-      if (!context.text) return;
-      return { systemPrompt: injectAtlasContext(event.systemPrompt, context.text, limits) };
     } catch (error) {
+      // Keep the previous section so a transient failure does not remove and re-add it.
       warnOnce(`Atlas context was not loaded: ${(error as Error).message}`, ctx.ui.notify.bind(ctx.ui));
-      return;
     }
+    // Always set the section so pi records only a transcript delta when it changes.
+    event.systemPromptOptions.sections.atlas_memory = lastSection;
   });
 
   pi.registerTool({

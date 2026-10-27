@@ -281,11 +281,6 @@ const CONTEXT_PREAMBLE = [
   "Append durable events to daily.md; use /atlas-compact to refresh current.md without deleting raw daily history.",
 ].join("\n");
 
-export function injectAtlasContext(systemPrompt: string, atlasText: string, limits: AtlasLimits): string {
-  const suffix = truncateHead(`\n\n${atlasText}`, limits.maxContextBytes, limits.maxContextLines).content;
-  return systemPrompt + suffix;
-}
-
 export async function buildAtlasContext(
   store: MemoryStore,
   prompt: string,

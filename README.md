@@ -13,8 +13,11 @@ of a private memory bank is required.
 
 ## Behavior
 
-- Injects a **bounded** selection of `projects.md`, current/daily context,
-  matched private project context, and triggered knowledge before an agent turn.
+- Adds a **bounded** selection of `projects.md`, current/daily context,
+  matched private project context, and triggered knowledge as an `atlas_memory`
+  system prompt section before an agent turn. Pi records the section in the
+  session transcript and appends only a delta when it changes, so earlier
+  messages stay provider-cacheable.
 - Reports each injected source and why it matched. Knowledge matching is
   case-insensitive and segment-aware (`pi` does not match `spinning`).
 - Uses the current working directory, prompt terms, and optional private aliases
@@ -31,12 +34,12 @@ bounded file.
 ## Privacy and provider disclosure
 
 Atlas files stay local **until Atlas injects or returns their contents**. Injected
-memory becomes part of pi's system prompt, and `atlas_read` results become tool
-messages. Pi sends that context to the currently selected model provider (and to
-any proxy/gateway configured for that provider), subject to that provider's
-retention and privacy policy. `/atlas-status` notifications and the private
-`config.json` itself are not intentionally sent to the model, but config-selected
-context is.
+memory becomes the `atlas_memory` section of pi's system prompt, recorded in the
+session transcript, and `atlas_read` results become tool messages. Pi sends that
+context to the currently selected model provider (and to any proxy/gateway
+configured for that provider), subject to that provider's retention and privacy
+policy. `/atlas-status` notifications and the private `config.json` itself are
+not intentionally sent to the model, but config-selected context is.
 
 Atlas performs no network requests and has no telemetry. It reads only beneath
 the configured memory root. Project `paths` are matching metadata; Atlas does
@@ -213,7 +216,8 @@ Restart pi after package changes, or use pi's `/reload` command.
 
 ## Development
 
-Requires Node.js 22.19.0 or newer, matching the pinned pi dependencies' engine requirement:
+Requires Node.js 22.19.0 or newer, matching the pinned pi 1.4.0 dependencies' engine
+requirement (`systemPromptOptions.sections` needs pi 1.4.0 or newer):
 
 ```bash
 pnpm install
