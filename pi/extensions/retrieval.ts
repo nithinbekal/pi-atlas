@@ -53,6 +53,7 @@ export interface AtlasContext {
   projectMatches: ProjectMatch[];
   knowledgeMatches: TriggerMatch[];
   truncated: boolean;
+  warnings: string[];
 }
 
 function parseCsvRow(line: string): string[] {
@@ -133,6 +134,10 @@ export function matchTriggers(text: string, entries: TriggerEntry[]): TriggerMat
     }
   }
   return [...matches.values()];
+}
+
+export function knowledgePath(filename: string): string {
+  return filename.startsWith("knowledge/") ? filename : `knowledge/${filename}`;
 }
 
 function stringArray(value: unknown, label: string): string[] | undefined {
@@ -252,9 +257,11 @@ async function addIfPresent(
   reason: string,
   limits: AtlasLimits,
   daily = false,
-): Promise<void> {
+): Promise<boolean> {
   const text = await store.readOptional(path);
-  if (text !== null) sources.push(boundedSource(path, title, reason, text, limits, daily));
+  if (text === null) return false;
+  sources.push(boundedSource(path, title, reason, text, limits, daily));
+  return true;
 }
 
 function renderSource(source: ContextSource): string {
@@ -286,6 +293,7 @@ export async function buildAtlasContext(
   limits: AtlasLimits,
 ): Promise<AtlasContext> {
   const sources: ContextSource[] = [];
+  const warnings: string[] = [];
   const configText = await store.readOptional("config.json");
   const config = configText === null ? {} : parsePrivateConfig(configText);
   const projectMatches = matchProjects(config, prompt, cwd);
@@ -304,7 +312,7 @@ export async function buildAtlasContext(
     for (const path of match.context) {
       if (seenContext.has(path)) continue;
       seenContext.add(path);
-      await addIfPresent(
+      const present = await addIfPresent(
         sources,
         store,
         path,
@@ -312,6 +320,7 @@ export async function buildAtlasContext(
         `${match.project} matched (${match.reasons.join("; ")})`,
         limits,
       );
+      if (!present) warnings.push(`${path} is listed in config.json for ${match.project} but does not exist`);
     }
   }
 
@@ -319,8 +328,8 @@ export async function buildAtlasContext(
   const triggerEntries = indexText === null ? [] : parseKnowledgeIndex(indexText);
   const knowledgeMatches = matchTriggers(prompt, triggerEntries).slice(0, limits.maxKnowledgeMatches);
   for (const match of knowledgeMatches) {
-    const path = `knowledge/${match.filename}`;
-    await addIfPresent(
+    const path = knowledgePath(match.filename);
+    const present = await addIfPresent(
       sources,
       store,
       path,
@@ -328,6 +337,7 @@ export async function buildAtlasContext(
       `prompt trigger(s): ${match.triggers.join(", ")}`,
       limits,
     );
+    if (!present) warnings.push(`${path} is listed in knowledge/index.csv but does not exist`);
   }
 
   if (current !== null) {
@@ -338,7 +348,7 @@ export async function buildAtlasContext(
 
   const preamble = truncateHead(CONTEXT_PREAMBLE, limits.maxContextBytes, limits.maxContextLines);
   if (sources.length === 0) {
-    return { text: "", sources: [], projectMatches, knowledgeMatches, truncated: false };
+    return { text: "", sources: [], projectMatches, knowledgeMatches, truncated: false, warnings };
   }
 
   const rendered: string[] = preamble.content ? [preamble.content] : [];
@@ -387,5 +397,6 @@ export async function buildAtlasContext(
     projectMatches,
     knowledgeMatches,
     truncated: totalTruncated,
+    warnings,
   };
 }

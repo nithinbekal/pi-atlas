@@ -126,6 +126,52 @@ test("an empty memory bank injects no wrapper-only context", async () => {
   assert.equal(context.text, "");
 });
 
+test("knowledge index rows with a knowledge/ prefix inject the file once", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "atlas-retrieval-prefixed-"));
+  const store = new MemoryStore(join(parent, "memory"), DEFAULT_LIMITS);
+  await store.replace("knowledge/index.csv", 'filename,description,triggers\nknowledge/team.md,Team membership,"team"\n');
+  await store.replace("knowledge/team.md", "team roster\n");
+
+  const context = await buildAtlasContext(store, "who is on the team", parent, DEFAULT_LIMITS);
+  const source = context.sources.find((candidate) => candidate.path === "knowledge/team.md");
+  assert.ok(source, "prefixed row must resolve to knowledge/team.md, not knowledge/knowledge/team.md");
+  assert.match(source.content, /team roster/);
+  assert.deepEqual(context.warnings, []);
+});
+
+test("knowledge index rows without a knowledge/ prefix still inject", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "atlas-retrieval-bare-"));
+  const store = new MemoryStore(join(parent, "memory"), DEFAULT_LIMITS);
+  await store.replace("knowledge/index.csv", 'filename,description,triggers\nteam.md,Team membership,"team"\n');
+  await store.replace("knowledge/team.md", "team roster\n");
+
+  const context = await buildAtlasContext(store, "who is on the team", parent, DEFAULT_LIMITS);
+  const source = context.sources.find((candidate) => candidate.path === "knowledge/team.md");
+  assert.ok(source);
+  assert.match(source.content, /team roster/);
+  assert.deepEqual(context.warnings, []);
+});
+
+test("missing knowledge and project context files are warned about, not dropped silently", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "atlas-retrieval-missing-"));
+  const store = new MemoryStore(join(parent, "memory"), DEFAULT_LIMITS);
+  await store.replace("knowledge/index.csv", 'filename,description,triggers\nknowledge/team.md,Team membership,"team"\n');
+  await store.replace("config.json", JSON.stringify({
+    projects: [{ name: "Example Project", aliases: ["example-app"], context: ["projects/example.md"] }],
+  }));
+  await store.replace("daily.md", "## Today's Date: 2026-01-01\n\nstill injected\n");
+
+  const context = await buildAtlasContext(store, "example-app team", parent, DEFAULT_LIMITS);
+  assert.equal(context.knowledgeMatches.length, 1);
+  assert.equal(context.sources.some((source) => source.path === "knowledge/team.md"), false);
+  assert.equal(context.sources.some((source) => source.path === "projects/example.md"), false);
+  assert.deepEqual(context.warnings, [
+    "projects/example.md is listed in config.json for Example Project but does not exist",
+    "knowledge/team.md is listed in knowledge/index.csv but does not exist",
+  ]);
+  assert.match(context.text, /still injected/);
+});
+
 test("unsafe knowledge filenames fail closed instead of escaping memory", async () => {
   const parent = await mkdtemp(join(tmpdir(), "atlas-retrieval-escape-"));
   const store = new MemoryStore(join(parent, "memory"), DEFAULT_LIMITS);

@@ -32,3 +32,19 @@ test("atlas_search bounds huge descriptions and trigger renderings", () => {
   assert.ok(Buffer.byteLength(text) <= OUTPUT_LIMITS.maxReadBytes);
   assert.ok(lineCount(text) <= OUTPUT_LIMITS.maxReadLines);
 });
+
+test("atlas_search lists indexed files when nothing matches", () => {
+  const text = renderSearchResults([], { maxReadBytes: 10_000, maxReadLines: 50 }, [
+    { filename: "knowledge/team.md", description: "Team membership", triggers: ["team"] },
+  ]);
+
+  assert.equal(text, "No matching knowledge files found. Indexed files:\n- knowledge/team.md: Team membership");
+});
+
+test("atlas_search does not double the knowledge/ prefix", () => {
+  const text = renderSearchResults([
+    { filename: "knowledge/team.md", description: "Team membership", triggers: ["team"] },
+  ], { maxReadBytes: 10_000, maxReadLines: 50 });
+
+  assert.match(text, /^Found 1 matching knowledge file\(s\):\n- knowledge\/team\.md \(matched: team; Team membership\)$/);
+});

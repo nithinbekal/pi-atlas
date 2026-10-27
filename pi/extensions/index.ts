@@ -6,10 +6,12 @@ import { atlasMemoryRoot, loadLimits } from "./config.ts";
 import {
   buildAtlasContext,
   injectAtlasContext,
+  knowledgePath,
   matchProjects,
   matchTriggers,
   parseKnowledgeIndex,
   parsePrivateConfig,
+  type TriggerEntry,
   type TriggerMatch,
 } from "./retrieval.ts";
 import { lineCount, MemoryStore, renderBoundedOutput, truncateHead, type BoundedText } from "./storage.ts";
@@ -24,12 +26,17 @@ export function renderAtlasRead(result: BoundedText, limits: { maxReadBytes: num
 export function renderSearchResults(
   matches: TriggerMatch[],
   limits: { maxReadBytes: number; maxReadLines: number },
+  indexed: TriggerEntry[] = [],
 ): string {
   if (matches.length === 0) {
-    return truncateHead("No matching knowledge files found.", limits.maxReadBytes, limits.maxReadLines).content;
+    const listing = indexed.map((entry) => `- ${knowledgePath(entry.filename)}: ${entry.description}`).join("\n");
+    const text = listing
+      ? `No matching knowledge files found. Indexed files:\n${listing}`
+      : "No matching knowledge files found.";
+    return truncateHead(text, limits.maxReadBytes, limits.maxReadLines).content;
   }
   const rows = matches.map((match) =>
-    `- knowledge/${match.filename} (matched: ${match.triggers.join(", ")}${match.description ? `; ${match.description}` : ""})`,
+    `- ${knowledgePath(match.filename)} (matched: ${match.triggers.join(", ")}${match.description ? `; ${match.description}` : ""})`,
   ).join("\n");
   const full = `Found ${matches.length} matching knowledge file(s):\n${rows}`;
   const bounded = truncateHead(full, limits.maxReadBytes, limits.maxReadLines);
@@ -61,8 +68,9 @@ export default function atlas(pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event, ctx) => {
     try {
       const context = await buildAtlasContext(store, event.prompt ?? "", ctx.cwd, limits);
+      if (context.warnings.length > 0) warnOnce(context.warnings.join("\n"), ctx.ui.notify.bind(ctx.ui));
+      else lastWarning = undefined;
       if (!context.text) return;
-      lastWarning = undefined;
       return { systemPrompt: injectAtlasContext(event.systemPrompt, context.text, limits) };
     } catch (error) {
       warnOnce(`Atlas context was not loaded: ${(error as Error).message}`, ctx.ui.notify.bind(ctx.ui));
@@ -131,10 +139,9 @@ export default function atlas(pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params) {
       const index = await store.readOptional("knowledge/index.csv");
-      const matches = index === null
-        ? []
-        : matchTriggers(params.query, parseKnowledgeIndex(index)).slice(0, limits.maxKnowledgeMatches);
-      const text = renderSearchResults(matches, limits);
+      const entries = index === null ? [] : parseKnowledgeIndex(index);
+      const matches = matchTriggers(params.query, entries).slice(0, limits.maxKnowledgeMatches);
+      const text = renderSearchResults(matches, limits, entries);
       return {
         content: [{ type: "text", text }],
         details: {
